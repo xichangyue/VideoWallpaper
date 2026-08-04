@@ -3931,10 +3931,6 @@ final class WallpaperController {
     }
 
     private func makePlayerItem(for url: URL, in session: WallpaperSession) -> AVPlayerItem {
-        // AVAssetResourceLoader-backed in-memory playback is intentionally disabled.
-        // On macOS 26.6 it reproducibly crashes inside CoreMedia's video/audio mentor
-        // threads during otherwise normal playback. AVURLAsset uses the system file
-        // cache and keeps CoreMedia on its stable, native file-loading path.
         let asset: AVAsset = AVURLAsset(url: url)
 
         let item = AVPlayerItem(asset: asset)
