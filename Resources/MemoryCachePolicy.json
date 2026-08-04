@@ -1,0 +1,13 @@
+{
+  "belowMinimumWallpaperCacheMB": 256,
+  "maximumTotalCacheFraction": 0.25,
+  "tiers": [
+    { "systemMemoryGB": 8, "maximumWallpaperCacheMB": 512 },
+    { "systemMemoryGB": 12, "maximumWallpaperCacheMB": 1024 },
+    { "systemMemoryGB": 16, "maximumWallpaperCacheMB": 2048 },
+    { "systemMemoryGB": 24, "maximumWallpaperCacheMB": 3072 },
+    { "systemMemoryGB": 32, "maximumWallpaperCacheMB": 4096 },
+    { "systemMemoryGB": 64, "maximumWallpaperCacheMB": 6144 },
+    { "systemMemoryGB": 128, "maximumWallpaperCacheMB": 8192 }
+  ]
+}

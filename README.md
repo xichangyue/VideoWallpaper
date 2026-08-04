@@ -1,0 +1,48 @@
+# VideoWallpaper
+
+Native macOS utility for playing local video and web wallpapers as desktop wallpaper.
+
+## Features
+
+- Dark wallpaper-library GUI with preview tiles for imported videos and web packages, plus type/tag filtering, tag editing, and per-display assignment.
+- Tags are normalized as hash-prefixed tokens separated by spaces, for example `#少女 #雨天 #抑郁感`; the tag filter supports multi-select.
+- The app infers playback by wallpaper type: video wallpapers use AVFoundation; web and compatible scene wallpapers use a restricted WebKit renderer.
+- Local web wallpaper packages can be imported from folders, HTML files, or zip archives. Common `project.json`, `manifest.json`, and `package.json` metadata is used to find the entry HTML and configurable properties.
+- HTTP/HTTPS wallpaper URLs are imported as offline snapshots. The downloader saves the entry page and its declared scripts, styles, images, fonts, and media under the managed wallpaper directory, rewrites those references to local files, and forces the snapshot to run without network access. Pages that depend on authentication, server APIs, or runtime-generated requests may not reproduce completely offline.
+- Wallpaper properties are shown in the GUI when available and injected through a Wallpaper Engine-style `wallpaperPropertyListener.applyUserProperties` payload. Compatible native scenes expose only controls that the local renderer can execute.
+- Web wallpapers are statically scanned for risky behavior such as external requests, local-network access, remote scripts, dynamic code, browser permission APIs, popups, and downloads. A risk-and-consequence confirmation appears before a risky wallpaper can become active.
+- Web wallpaper runtime protection blocks external requests, popups, and cross-directory file navigation unless the user has explicitly trusted that wallpaper. URL-derived offline snapshots remain network-blocked even after their local scripts are trusted.
+- Desktop web wallpapers receive synthetic mousemove events from the global cursor position so interactive effects such as eyes following the mouse can work even while the wallpaper window passes clicks through to the desktop.
+- Managed wallpaper directory with configurable storage location.
+- Settings are grouped into General, Playback, and Performance tabs. Wallpaper start/stop, login auto-start, volume, fill mode, playback order, video rendering load, web rendering quality/frame rate, memory caching, and storage location are managed there.
+- Menu bar controls include start, pause/resume without losing the current playback position, stop, mute, and volume adjustment.
+- The app starts silently as a menu-bar utility; use the menu-bar item to open the main panel.
+- Multi-display desktop wallpaper windows at desktop level with mouse passthrough; each connected display can use its own wallpaper source and playback settings.
+- Single-video playback uses `AVPlayerLooper` for smoother looping without recreating the current player item.
+- Eligible local videos are loaded into a bounded RAM cache before playback. This prevents every short-video loop from reading the entire file again; files over the limit or systems without enough available memory automatically fall back to normal disk-backed playback. Per-wallpaper limits are selected by installed-memory floor tiers from `Resources/MemoryCachePolicy.json` (8 GB/512 MB, 12 GB/1 GB, 16 GB/2 GB, 24 GB/3 GB, 32 GB/4 GB, 64 GB/6 GB, 128 GB/8 GB) and can be customized before rebuilding.
+- Video and web performance settings include automatic modes. At every launch the effective frame-rate and render-scale caps are recalculated from memory, processor count, and connected displays. Manual settings cannot exceed the hardware cap, and a runtime governor progressively reduces quality or pauses playback when the app remains above 30% of total CPU capacity.
+- Folder playback supports sequential and random order, with the next video queued before the current one ends.
+- LaunchAgent-based login auto-start.
+- Bundled `VideoWallpaperLockScreen.saver` screen saver module that reads the selected lock-screen wallpaper when possible, including video and web wallpapers.
+
+## Wallpaper Engine Scene Compatibility
+
+VideoWallpaper can safely unpack Wallpaper Engine `PKGV0001` `scene.pkg` projects, decode common `TEXV0005` RGBA/DXT/LZ4 textures, and generate a local compatibility scene from the real background image. The compatibility renderer supports common particle systems, sprite atlases, property bindings, allowlisted clock/date components, and MDLV21/MDLS3/MDLA6 puppet skinning with replacement and additive bone-animation layers. The importer validates package ranges and paths and never executes original SceneScript or package binaries.
+
+This remains partial compatibility. Original Wallpaper Engine shaders, audio graphs, arbitrary SceneScript, bone simulation/IK, and unrecognized particle or model versions are not reproduced. See `THIRD-PARTY-NOTICES.md` for format-decoder attribution.
+
+## Lock Screen Limitation
+
+macOS does not expose a public API for ordinary apps to render a video directly on the login window background. The included lock-screen support is implemented through a screen saver module. After installation, select `VideoWallpaperLockScreen` in System Settings if macOS does not select it automatically.
+
+## Build
+
+```sh
+./build.sh
+```
+
+The built app is written to this project directory:
+
+```text
+dist/VideoWallpaper.app
+```
