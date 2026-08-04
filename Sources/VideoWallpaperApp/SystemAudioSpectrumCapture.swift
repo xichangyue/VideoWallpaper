@@ -86,9 +86,6 @@ final class SystemAudioSpectrumCapture: NSObject, SCStreamOutput, SCStreamDelega
                 configuration.sourceRect = CGRect(x: 0, y: 0, width: 1, height: 1)
 
                 let candidate = SCStream(filter: filter, configuration: configuration, delegate: self)
-                // Some macOS releases continue producing video frames for audio-only streams.
-                // Accept a throttled 2x2 screen output so ScreenCaptureKit does not flood
-                // WindowServer and the unified log with undeliverable frame callbacks.
                 try candidate.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
                 try candidate.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
                 try await candidate.startCapture()
@@ -349,7 +346,6 @@ final class SystemAudioSpectrumCapture: NSObject, SCStreamOutput, SCStreamDelega
                 power += magnitude * magnitude
             }
 
-            // vDSP's real-to-complex forward transform has an additional 2x scale.
             let binCount = Double(upperBin - lowerBin + 1)
             let amplitude = sqrt(power / binCount) * 2 / Double(windowSize)
             let decibels = 20 * log10(max(amplitude, 0.000_000_1))

@@ -4539,7 +4539,6 @@ private enum SceneTextureDecoder {
         return (width, height)
     }
 
-    // Wallpaper Engine's shader treats R8/RG88 as opacity textures, not red/green color images.
     private static func expandR(_ data: Data, pixelCount: Int) -> Data {
         let source = [UInt8](data)
         var output = [UInt8](repeating: 255, count: pixelCount * 4)
