@@ -1,8 +1,28 @@
 import AppKit
 import AVFoundation
+import Darwin
 import QuartzCore
 import ScreenSaver
 import WebKit
+
+private enum SaverUserPaths {
+    static var homeDirectory: URL {
+        if let record = getpwuid(getuid()),
+           let rawPath = record.pointee.pw_dir,
+           let path = String(validatingUTF8: rawPath),
+           !path.isEmpty {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    static var supportDirectory: URL {
+        homeDirectory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("VideoWallpaper", isDirectory: true)
+    }
+}
 
 private struct SaverDisplayConfig: Codable {
     var wallpaperID: String?
@@ -195,9 +215,7 @@ private struct SaverWallpaperLibrary: Codable {
 
 private enum SaverWallpaperLibraryStore {
     static var libraryURL: URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VideoWallpaper", isDirectory: true)
+        SaverUserPaths.supportDirectory
             .appendingPathComponent("wallpapers.json")
     }
 
@@ -254,9 +272,7 @@ private enum SaverDisplayManager {
 
 private enum SaverConfigStore {
     static var configURL: URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VideoWallpaper", isDirectory: true)
+        SaverUserPaths.supportDirectory
             .appendingPathComponent("config.json")
     }
 
