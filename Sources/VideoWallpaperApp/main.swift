@@ -9,6 +9,29 @@ import WebKit
 extension Notification.Name {
     static let videoWallpaperAudioSettingsChanged = Notification.Name("VideoWallpaperAudioSettingsChanged")
     static let videoWallpaperPlaybackStateChanged = Notification.Name("VideoWallpaperPlaybackStateChanged")
+    static let videoWallpaperShowController = Notification.Name("com.xiyue.VideoWallpaper.showController")
+}
+
+private final class SingleInstanceGuard {
+    private let descriptor: Int32
+
+    init?() {
+        let path = NSTemporaryDirectory() + "com.xiyue.VideoWallpaper-\(getuid()).lock"
+        let descriptor = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            return nil
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            close(descriptor)
+            return nil
+        }
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
 }
 
 private final class TextOnlyAlertActionTarget: NSObject {
@@ -222,8 +245,8 @@ struct AppConfig: Codable {
         webFrameRate: 0,
         wallpaperFrameRate: 0,
         renderQuality: WebQuality.auto.rawValue,
-        memoryCacheEnabled: false,
-        performancePolicyVersion: 3
+        memoryCacheEnabled: true,
+        performancePolicyVersion: 4
     )
 
     enum CodingKeys: String, CodingKey {
@@ -266,8 +289,8 @@ struct AppConfig: Codable {
         webFrameRate: Int = 0,
         wallpaperFrameRate: Int = 0,
         renderQuality: String = WebQuality.auto.rawValue,
-        memoryCacheEnabled: Bool = false,
-        performancePolicyVersion: Int = 3
+        memoryCacheEnabled: Bool = true,
+        performancePolicyVersion: Int = 4
     ) {
         self.videoPath = videoPath
         self.videoFolderPath = videoFolderPath
@@ -309,7 +332,7 @@ struct AppConfig: Codable {
         webFrameRate = try container.decodeIfPresent(Int.self, forKey: .webFrameRate) ?? 0
         wallpaperFrameRate = try container.decodeIfPresent(Int.self, forKey: .wallpaperFrameRate) ?? 0
         renderQuality = try container.decodeIfPresent(String.self, forKey: .renderQuality) ?? WebQuality.auto.rawValue
-        memoryCacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .memoryCacheEnabled) ?? false
+        memoryCacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .memoryCacheEnabled) ?? true
         performancePolicyVersion = try container.decodeIfPresent(Int.self, forKey: .performancePolicyVersion) ?? 0
     }
 
@@ -2291,6 +2314,271 @@ enum ConfigStore {
     }
 }
 
+private final class MemoryCacheHealthMonitor {
+    static let shared = MemoryCacheHealthMonitor()
+
+    private struct RunMarker: Codable {
+        var processIdentifier: Int32
+        var startedAt: Date
+        var systemSignature: String
+    }
+
+    private struct Suppression: Codable {
+        var systemSignature: String
+        var detectedAt: Date
+        var reason: String
+        var reportName: String
+    }
+
+    private struct CrashBody: Decodable {
+        struct Exception: Decodable {
+            var type: String?
+            var signal: String?
+        }
+
+        struct Thread: Decodable {
+            var name: String?
+            var queue: String?
+            var triggered: Bool?
+        }
+
+        var pid: Int?
+        var procName: String?
+        var faultingThread: Int?
+        var exception: Exception?
+        var threads: [Thread]?
+    }
+
+    private let lock = NSLock()
+    private var activePlaybackCount = 0
+    private var suppression: Suppression?
+
+    private var markerURL: URL {
+        ConfigStore.supportDirectory.appendingPathComponent("memory-cache-active.json")
+    }
+
+    private var suppressionURL: URL {
+        ConfigStore.supportDirectory.appendingPathComponent("memory-cache-suppression.json")
+    }
+
+    var isAllowed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return suppression?.systemSignature != Self.systemSignature
+    }
+
+    var suppressionReason: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let suppression, suppression.systemSignature == Self.systemSignature else { return nil }
+        return suppression.reason
+    }
+
+    func prepareForLaunch() {
+        try? FileManager.default.createDirectory(
+            at: ConfigStore.supportDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let savedSuppression = Self.decode(Suppression.self, from: suppressionURL)
+        if savedSuppression?.systemSignature == Self.systemSignature {
+            suppression = savedSuppression
+        } else {
+            suppression = nil
+            try? FileManager.default.removeItem(at: suppressionURL)
+        }
+
+        guard let marker = Self.decode(RunMarker.self, from: markerURL) else { return }
+        try? FileManager.default.removeItem(at: markerURL)
+        guard marker.systemSignature == Self.systemSignature,
+              suppression == nil,
+              let finding = Self.findMediaCrash(
+                since: marker.startedAt,
+                expectedProcessIdentifier: Int(marker.processIdentifier)
+              ) else {
+            return
+        }
+
+        let detected = Suppression(
+            systemSignature: Self.systemSignature,
+            detectedAt: Date(),
+            reason: finding.reason,
+            reportName: finding.reportName
+        )
+        suppression = detected
+        try? Self.encode(detected, to: suppressionURL)
+        NSLog("Video memory cache disabled for this system: %@", finding.reason)
+    }
+
+    func beginPlayback() {
+        lock.lock()
+        defer { lock.unlock() }
+        activePlaybackCount += 1
+        guard activePlaybackCount == 1 else { return }
+        let marker = RunMarker(
+            processIdentifier: getpid(),
+            startedAt: Date(),
+            systemSignature: Self.systemSignature
+        )
+        try? FileManager.default.createDirectory(
+            at: ConfigStore.supportDirectory,
+            withIntermediateDirectories: true
+        )
+        try? Self.encode(marker, to: markerURL)
+    }
+
+    func endPlayback() {
+        lock.lock()
+        defer { lock.unlock() }
+        activePlaybackCount = max(0, activePlaybackCount - 1)
+        guard activePlaybackCount == 0 else { return }
+        try? FileManager.default.removeItem(at: markerURL)
+    }
+
+    func markCleanTermination() {
+        lock.lock()
+        activePlaybackCount = 0
+        try? FileManager.default.removeItem(at: markerURL)
+        lock.unlock()
+    }
+
+    func retryOnCurrentSystem() {
+        lock.lock()
+        suppression = nil
+        try? FileManager.default.removeItem(at: suppressionURL)
+        lock.unlock()
+    }
+
+    static func diagnosticReason(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let newline = data.firstIndex(of: 0x0A),
+              newline < data.index(before: data.endIndex),
+              let body = try? JSONDecoder().decode(
+                CrashBody.self,
+                from: Data(data[data.index(after: newline)...])
+              ),
+              let processIdentifier = body.pid else {
+            return nil
+        }
+        return mediaCrashReason(at: url, expectedProcessIdentifier: processIdentifier)
+    }
+
+    private static var systemSignature: String {
+        [
+            sysctlString("hw.model"),
+            sysctlString("kern.osversion"),
+            ProcessInfo.processInfo.operatingSystemVersionString
+        ].joined(separator: "|")
+    }
+
+    private static func sysctlString(_ name: String) -> String {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 1 else { return "unknown" }
+        var value = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return "unknown" }
+        return String(cString: value)
+    }
+
+    private static func encode<Value: Encodable>(_ value: Value, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(value).write(to: url, options: [.atomic])
+    }
+
+    private static func decode<Value: Decodable>(_ type: Value.Type, from url: URL) -> Value? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(type, from: data)
+    }
+
+    private static func findMediaCrash(
+        since startDate: Date,
+        expectedProcessIdentifier: Int
+    ) -> (reason: String, reportName: String)? {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/DiagnosticReports", isDirectory: true)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let candidates = urls.compactMap { url -> (URL, Date)? in
+            let name = url.lastPathComponent.lowercased()
+            guard name.hasPrefix("videowallpaper-"),
+                  url.pathExtension == "ips" || url.pathExtension == "crash",
+                  let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let date = values.contentModificationDate,
+                  date >= startDate.addingTimeInterval(-5) else {
+                return nil
+            }
+            return (url, date)
+        }.sorted { $0.1 > $1.1 }
+
+        for (url, _) in candidates {
+            if let reason = mediaCrashReason(at: url, expectedProcessIdentifier: expectedProcessIdentifier) {
+                return (reason, url.lastPathComponent)
+            }
+        }
+        for (url, _) in candidates {
+            if let reason = mediaCrashReason(at: url, expectedProcessIdentifier: nil) {
+                return (reason, url.lastPathComponent)
+            }
+        }
+        return nil
+    }
+
+    private static func mediaCrashReason(
+        at url: URL,
+        expectedProcessIdentifier: Int?
+    ) -> String? {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        if url.pathExtension == "ips",
+           let newline = data.firstIndex(of: 0x0A),
+           newline < data.index(before: data.endIndex) {
+            let bodyData = data[data.index(after: newline)...]
+            if let body = try? JSONDecoder().decode(CrashBody.self, from: bodyData),
+               body.procName == "VideoWallpaper",
+               expectedProcessIdentifier == nil || body.pid == expectedProcessIdentifier {
+                let threads = body.threads ?? []
+                let thread = body.faultingThread.flatMap { index in
+                    threads.indices.contains(index) ? threads[index] : nil
+                } ?? threads.first(where: { $0.triggered == true })
+                let identity = [thread?.name, thread?.queue]
+                    .compactMap { $0?.lowercased() }
+                    .joined(separator: " ")
+                let signal = body.exception?.signal?.uppercased() ?? ""
+                let type = body.exception?.type?.uppercased() ?? ""
+                let exactMentor = identity.contains("coremedia.audiomentor")
+                    || identity.contains("coremedia.videomentor")
+                let coreMediaMemoryFault = identity.contains("com.apple.coremedia")
+                    && (["SIGSEGV", "SIGBUS"].contains(signal) || type == "EXC_BAD_ACCESS")
+                if exactMentor || coreMediaMemoryFault {
+                    let threadName = thread?.name ?? thread?.queue ?? "CoreMedia"
+                    let failure = [type, signal].filter { !$0.isEmpty }.joined(separator: "/")
+                    return "上次内存预缓存播放在 \(threadName) 线程发生 \(failure.isEmpty ? "致命崩溃" : failure)，已仅对当前 Mac 与系统版本自动停用。报告：\(url.lastPathComponent)"
+                }
+            }
+        }
+
+        guard let text = String(data: data, encoding: .utf8)?.lowercased(),
+              text.contains("videowallpaper"),
+              text.contains("crashed"),
+              text.contains("com.apple.coremedia"),
+              (expectedProcessIdentifier.map { text.contains("[\($0)]") } ?? true) else {
+            return nil
+        }
+        if text.contains("coremedia.audiomentor") || text.contains("coremedia.videomentor") {
+            return "上次内存预缓存播放在 CoreMedia mentor 线程发生致命崩溃，已仅对当前 Mac 与系统版本自动停用。报告：\(url.lastPathComponent)"
+        }
+        return nil
+    }
+}
+
 final class VideoPlayerView: NSView {
     private let playerLayer: AVPlayerLayer
 
@@ -3169,8 +3457,10 @@ private final class MemoryBackedVideoAsset {
     let asset: AVURLAsset
     private let loader: MemoryVideoResourceLoader
     private let loaderQueue: DispatchQueue
+    private var isInvalidated = false
 
     init(sourceURL: URL, resource: CachedVideoResource) {
+        MemoryCacheHealthMonitor.shared.beginPlayback()
         loader = MemoryVideoResourceLoader(resource: resource)
         loaderQueue = DispatchQueue(label: "com.xiyue.VideoWallpaper.memory-loader.\(UUID().uuidString)")
         let fileName = sourceURL.lastPathComponent.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
@@ -3181,7 +3471,14 @@ private final class MemoryBackedVideoAsset {
     }
 
     func invalidateAfterPlayback() {
+        guard !isInvalidated else { return }
+        isInvalidated = true
         asset.resourceLoader.setDelegate(nil, queue: nil)
+        MemoryCacheHealthMonitor.shared.endPlayback()
+    }
+
+    deinit {
+        invalidateAfterPlayback()
     }
 }
 
@@ -3931,7 +4228,22 @@ final class WallpaperController {
     }
 
     private func makePlayerItem(for url: URL, in session: WallpaperSession) -> AVPlayerItem {
-        let asset: AVAsset = AVURLAsset(url: url)
+        let asset: AVAsset
+        if activeConfig?.memoryCacheEnabled == true,
+           MemoryCacheHealthMonitor.shared.isAllowed,
+           let resource = VideoMemoryCache.shared.resource(for: url) {
+            let key = url.standardizedFileURL.path
+            let memoryAsset: MemoryBackedVideoAsset
+            if let existing = session.memoryAssets[key] {
+                memoryAsset = existing
+            } else {
+                memoryAsset = MemoryBackedVideoAsset(sourceURL: url, resource: resource)
+                session.memoryAssets[key] = memoryAsset
+            }
+            asset = memoryAsset.asset
+        } else {
+            asset = AVURLAsset(url: url)
+        }
 
         let item = AVPlayerItem(asset: asset)
         item.preferredPeakBitRate = 0
@@ -5742,7 +6054,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate, NSCol
 
     @objc private func openSettings() {
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 560),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -5815,17 +6127,32 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate, NSCol
         performanceDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         performanceDetail.widthAnchor.constraint(equalToConstant: 390).isActive = true
 
-        let memoryCacheButton = NSButton(checkboxWithTitle: "短视频自定义内存播放（已停用）", target: nil, action: nil)
-        memoryCacheButton.state = .off
-        memoryCacheButton.isEnabled = false
-        let memoryCacheDetail = NSTextField(labelWithString: "macOS 26 的 CoreMedia 会在自定义内存资源解码时崩溃，当前统一使用系统文件缓存和原生磁盘播放路径。")
+        let memoryCacheSuppression = MemoryCacheHealthMonitor.shared.suppressionReason
+        let memoryCacheButton = NSButton(checkboxWithTitle: "短视频内存预缓存", target: nil, action: nil)
+        memoryCacheButton.state = config.memoryCacheEnabled && memoryCacheSuppression == nil ? .on : .off
+        memoryCacheButton.isEnabled = memoryCacheSuppression == nil
+        let normalMemoryCacheDetail = "符合大小和可用内存限制的视频会在播放前载入内存（\(VideoMemoryCache.shared.limitDescription)）。若检测到内存播放导致 CoreMedia 崩溃，下次启动只会在当前 Mac 和当前系统版本自动熔断；系统升级后自动重试。"
+        let memoryCacheDetail = NSTextField(labelWithString: memoryCacheSuppression ?? normalMemoryCacheDetail)
         memoryCacheDetail.font = .systemFont(ofSize: 11)
         memoryCacheDetail.textColor = .secondaryLabelColor
         memoryCacheDetail.lineBreakMode = .byWordWrapping
-        memoryCacheDetail.maximumNumberOfLines = 2
+        memoryCacheDetail.maximumNumberOfLines = 5
         memoryCacheDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         memoryCacheDetail.widthAnchor.constraint(equalToConstant: 390).isActive = true
-        let memoryCacheControl = NSStackView(views: [memoryCacheButton, memoryCacheDetail])
+        let memoryCacheRetryButton = NSButton(title: "在当前系统重新尝试", target: nil, action: nil)
+        memoryCacheRetryButton.isHidden = memoryCacheSuppression == nil
+        var memoryCacheWasRetried = false
+        let memoryCacheRetryTarget = ModalActionTarget {
+            MemoryCacheHealthMonitor.shared.retryOnCurrentSystem()
+            memoryCacheWasRetried = true
+            memoryCacheButton.isEnabled = true
+            memoryCacheButton.state = .on
+            memoryCacheDetail.stringValue = normalMemoryCacheDetail
+            memoryCacheRetryButton.isHidden = true
+        }
+        memoryCacheRetryButton.target = memoryCacheRetryTarget
+        memoryCacheRetryButton.action = #selector(ModalActionTarget.invoke)
+        let memoryCacheControl = NSStackView(views: [memoryCacheButton, memoryCacheDetail, memoryCacheRetryButton])
         memoryCacheControl.orientation = .vertical
         memoryCacheControl.alignment = .leading
         memoryCacheControl.spacing = 4
@@ -5936,7 +6263,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate, NSCol
         saveButton.action = #selector(ModalActionTarget.invoke)
         cancelButton.target = cancelTarget
         cancelButton.action = #selector(ModalActionTarget.invoke)
-        modalActionTargets = [saveTarget, cancelTarget, fpsWarningTarget]
+        modalActionTargets = [saveTarget, cancelTarget, fpsWarningTarget, memoryCacheRetryTarget]
 
         let buttonRow = NSStackView(views: [cancelButton, saveButton])
         buttonRow.orientation = .horizontal
@@ -5973,8 +6300,10 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate, NSCol
         newConfig.wallpaperDirectoryPath = directoryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         newConfig.renderQuality = detailPopup.selectedItem?.representedObject as? String ?? WebQuality.auto.rawValue
         newConfig.wallpaperFrameRate = fpsPopup.selectedItem?.representedObject as? Int ?? 0
-        newConfig.memoryCacheEnabled = false
-        newConfig.performancePolicyVersion = 3
+        newConfig.memoryCacheEnabled = memoryCacheSuppression != nil && !memoryCacheWasRetried
+            ? config.memoryCacheEnabled
+            : memoryCacheButton.state == .on
+        newConfig.performancePolicyVersion = 4
         newConfig.muted = muteButton.state == .on
         newConfig.volume = volumeSlider.floatValue
         newConfig.wallpaperEnabled = wallpaperEnabledButton.state == .on
@@ -6114,10 +6443,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         setupMainMenu()
         setupStatusItem()
+        MemoryCacheHealthMonitor.shared.prepareForLaunch()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(audioSettingsDidChange),
             name: .videoWallpaperAudioSettingsChanged,
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(showControllerFromExternalLaunch),
+            name: .videoWallpaperShowController,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(otherInstanceDidLaunch),
+            name: NSWorkspace.didLaunchApplicationNotification,
             object: nil
         )
         var config = ConfigStore.load()
@@ -6131,9 +6473,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             config.performancePolicyVersion = 2
             try? ConfigStore.save(config)
         }
-        if config.performancePolicyVersion < 3 || config.memoryCacheEnabled {
-            config.memoryCacheEnabled = false
-            config.performancePolicyVersion = 3
+        if config.performancePolicyVersion < 4 {
+            config.memoryCacheEnabled = true
+            config.performancePolicyVersion = 4
             try? ConfigStore.save(config)
         }
 
@@ -6153,10 +6495,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        wallpaperController.stop()
+        MemoryCacheHealthMonitor.shared.markCleanTermination()
     }
 
     private func setupStatusItem() {
@@ -6302,6 +6651,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showController()
     }
 
+    @objc private func showControllerFromExternalLaunch(_ notification: Notification) {
+        showController()
+    }
+
+    @objc private func otherInstanceDidLaunch(_ notification: Notification) {
+        guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication,
+              application.processIdentifier != getpid(),
+              application.bundleIdentifier == Bundle.main.bundleIdentifier else {
+            return
+        }
+        application.terminate()
+    }
+
     @objc private func startFromMenu() {
         var config = ConfigStore.load()
         var library = WallpaperLibraryStore.load()
@@ -6334,6 +6697,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+if let optionIndex = CommandLine.arguments.firstIndex(of: "--inspect-memory-cache-crash"),
+   CommandLine.arguments.indices.contains(optionIndex + 1) {
+    let reportURL = URL(fileURLWithPath: CommandLine.arguments[optionIndex + 1])
+    if let reason = MemoryCacheHealthMonitor.diagnosticReason(at: reportURL) {
+        print(reason)
+        exit(EXIT_SUCCESS)
+    }
+    FileHandle.standardError.write(Data("No matching memory-cache crash signature\n".utf8))
+    exit(2)
+}
+
 if let optionIndex = CommandLine.arguments.firstIndex(of: "--recompile-scene"),
    CommandLine.arguments.indices.contains(optionIndex + 1) {
     let sceneURL = URL(
@@ -6351,8 +6725,29 @@ if let optionIndex = CommandLine.arguments.firstIndex(of: "--recompile-scene"),
     }
 }
 
+guard let singleInstanceGuard = SingleInstanceGuard() else {
+    DistributedNotificationCenter.default().postNotificationName(
+        .videoWallpaperShowController,
+        object: nil,
+        userInfo: nil,
+        deliverImmediately: true
+    )
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.xiyue.VideoWallpaper")
+        .first(where: { $0.processIdentifier != getpid() })?
+        .activate(options: [.activateIgnoringOtherApps])
+    exit(EXIT_SUCCESS)
+}
+
+for application in NSRunningApplication.runningApplications(
+    withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.xiyue.VideoWallpaper"
+) where application.processIdentifier != getpid() {
+    application.terminate()
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
-app.run()
+withExtendedLifetime(singleInstanceGuard) {
+    app.run()
+}

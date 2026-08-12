@@ -6,14 +6,28 @@ BUILD_DIR="$ROOT_DIR/build"
 OUTPUT_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$OUTPUT_DIR/VideoWallpaper.app"
 SAVER_BUNDLE="$BUILD_DIR/VideoWallpaperLockScreen.saver"
+DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-13.0}
+TARGET_ARCH=${VIDEO_WALLPAPER_ARCH:-arm64}
+TARGET_TRIPLE="$TARGET_ARCH-apple-macos$DEPLOYMENT_TARGET"
+if [ -n "${MACOSX_SDK_PATH:-}" ]; then
+  SDK_PATH=$MACOSX_SDK_PATH
+elif [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk ]; then
+  SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
+else
+  SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+fi
+MODULE_CACHE_DIR=${SWIFT_MODULE_CACHE_PATH:-$BUILD_DIR/ModuleCache}
 
 rm -rf "$BUILD_DIR" "$APP_BUNDLE"
-mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+mkdir -p "$BUILD_DIR" "$OUTPUT_DIR" "$MODULE_CACHE_DIR"
 
 mkdir -p "$SAVER_BUNDLE/Contents/MacOS"
 cp "$ROOT_DIR/Resources/SaverInfo.plist" "$SAVER_BUNDLE/Contents/Info.plist"
 
 swiftc \
+  -target "$TARGET_TRIPLE" \
+  -sdk "$SDK_PATH" \
+  -module-cache-path "$MODULE_CACHE_DIR" \
   -O \
   "$ROOT_DIR/Sources/LockScreenSaver/LockScreenSaver.swift" \
   "$ROOT_DIR/Sources/Shared/LocalWallpaperSchemeHandler.swift" \
@@ -38,6 +52,9 @@ cp "$ROOT_DIR/THIRD-PARTY-NOTICES.md" "$APP_BUNDLE/Contents/Resources/THIRD-PART
 cp -R "$SAVER_BUNDLE" "$APP_BUNDLE/Contents/Resources/VideoWallpaperLockScreen.saver"
 
 swiftc \
+  -target "$TARGET_TRIPLE" \
+  -sdk "$SDK_PATH" \
+  -module-cache-path "$MODULE_CACHE_DIR" \
   -O \
   "$ROOT_DIR/Sources/VideoWallpaperApp/main.swift" \
   "$ROOT_DIR/Sources/VideoWallpaperApp/RemoteWebWallpaperDownloader.swift" \
